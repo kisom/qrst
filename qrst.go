@@ -91,7 +91,7 @@ type Header struct {
 	Raw           []byte
 	Magic         [4]byte
 	Version       float32
-	Checksum      [4]byte
+	Checksum      uint32
 	DiskCapacity  byte
 	CurrentVolume byte
 	VolumeCount   byte
@@ -120,16 +120,10 @@ func readHeader(r io.Reader, h *Header) error {
 
 	bits := binary.LittleEndian.Uint32(h.Raw[4:8])
 	h.Version = math.Float32frombits(bits)
-	copy(h.Checksum[:], h.Raw[8:12])
+	h.Checksum = binary.LittleEndian.Uint32(h.Raw[8:12])
 
 	h.DiskCapacity = h.Raw[12]
-
-	switch h.DiskCapacity {
-	case 3: // 720K
-		h.Geometry = Geometry{1, 79, 512, 9, 720 * 1024}
-	case 4:
-		h.Geometry = Geometry{1, 79, 512, 18, 1440 * 1024}
-	}
+	h.Geometry = GeometryFromCapacity[h.DiskCapacity]
 
 	h.CurrentVolume = h.Raw[13]
 	h.VolumeCount = h.Raw[14]
@@ -267,5 +261,112 @@ func (f *File) Assemble() ([]byte, error) {
 		}
 		copy(buffer[offset:], data.Data)
 	}
+
 	return buffer, nil
+}
+
+func (f *File) Resize(capacity byte) ([]byte, error) {
+	resized := &File{}
+	image, err := f.Assemble()
+	if err != nil {
+		return nil, err
+	}
+
+	// Build the new header. It'll be constructed by reading it
+	// from a buffer so that all the normal sanity checks and
+	// processing apply.
+	rawHeader := make([]byte, HeaderLength)
+	copy(rawHeader, f.Header.Raw)
+	rawHeader[12] = capacity
+	buf := bytes.NewBuffer(rawHeader)
+
+	err = readHeader(buf, &resized.Header)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resize the disk by expanding.
+	if resized.Header.Geometry.DiskSize < f.Header.Geometry.DiskSize {
+		// We need to shrink the disk, which means we need to
+		// make sure there's enough blank space to
+		// cut. Unfortuntely, I don't have time for this right
+		// now, and I don't need this.
+		panic("shrinking images isn't supported")
+	} else {
+		err = resized.Disassemble(image)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	err = resized.UpdateChecksum()
+	if err != nil {
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+func (f *File) Disassemble(image []byte) error {
+	tracklen := f.Header.Geometry.TrackLength()
+	for cylinder := 0; cylinder <= f.Header.Geometry.Cylinders; cylinder++ {
+		for head := 0; head <= f.Header.Geometry.Heads; head++ {
+			data := Data{
+				Head:     head,
+				Cylinder: cylinder,
+			}
+
+			if len(image) > 0 {
+				data.Type = 0
+				data.Data = make([]byte, tracklen)
+				copy(data.Data, image[:tracklen])
+				image = image[tracklen:]
+			} else {
+				data.Type = 1
+				data.Data = []byte{246}
+			}
+
+			f.Data = append(f.Data, data)
+		}
+	}
+
+	return nil
+}
+
+// In versions below 5, the checksum is the sum of all bytes on the
+// disc, each byte multiplied by (1 + its offset on the disc). So for
+// a 360k disc it would be (1 * first byte of first sector) + (2 *
+// second byte of first sector) + ... + (368640 * last byte of last
+// sector).
+//
+// In version 5, the CRC-32 covers the compressed data.
+
+func (f *File) UpdateChecksum() error {
+	image, err := f.Assemble()
+	if err != nil {
+		return err
+	}
+
+	f.Header.Checksum = checksum(image)
+	binary.LittleEndian.PutUint32(f.Header.Raw[8:12], f.Header.Checksum)
+
+	return nil
+}
+
+// TODO: calculate checksum for each sector
+func checksum(data []byte) uint32 {
+	return 0
+}
+
+func (f *File) VerifyChecksum() error {
+	image, err := f.Assemble()
+	if err != nil {
+		return err
+	}
+
+	if checksum(image) != f.Header.Checksum {
+		return errors.New("qrst: checksum mismatch")
+	}
+
+	return nil
 }

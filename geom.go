@@ -32,3 +32,8 @@ func (g Geometry) TrackOffset(head int, cyl int) (int, error) {
 	}
 	return (cyl*g.Heads + head) * g.SectorsPerTrack, nil
 }
+
+var GeometryFromCapacity = map[byte]Geometry{
+	3: Geometry{1, 79, 512, 9, 720 * 1024},   // 720K
+	4: Geometry{1, 79, 512, 18, 1440 * 1024}, // 1.44M
+}
