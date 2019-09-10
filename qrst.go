@@ -20,10 +20,12 @@ const HeaderLength = 796
 
 // TODO: convert these to new Go errors (idgaf rn)
 var (
-	ErrInvalidHeader = errors.New("qrst: header is too short")
-	ErrBadMagic      = errors.New("qrst: bad magic in header")
-	ErrBadTrailer    = errors.New("qrst: bad trailer in header")
-	ErrBadDataHeader = errors.New("qrst: bad data record header")
+	ErrInvalidHeader         = errors.New("qrst: header is too short")
+	ErrBadMagic              = errors.New("qrst: bad magic in header")
+	ErrBadTrailer            = errors.New("qrst: bad trailer in header")
+	ErrBadDataHeader         = errors.New("qrst: bad data record header")
+	ErrInvalidDataRecordType = errors.New("qrst: invalid data record type")
+	ErrInvalidChecksum       = errors.New("qrst: invalid checksum")
 )
 
 var magic = []byte("QRST")
@@ -148,6 +150,12 @@ func readHeader(r io.Reader, h *Header) error {
 	return nil
 }
 
+const (
+	RecordData       byte = 0
+	RecordBlank      byte = 1
+	RecordCompressed byte = 2
+)
+
 // Data represents a track's worth of data in the image.
 type Data struct {
 	Cylinder int
@@ -155,6 +163,33 @@ type Data struct {
 	Type     byte
 	Length   uint16
 	Data     []byte
+	Checksum uint32
+	Filler   byte
+}
+
+func (data Data) Checksum(g Geometry) (uint32, error) {
+	offset, err := g.TrackOffset(data.Head, data.Cylinder)
+	if err != nil {
+		return 0, err
+	}
+	tracklen := uint32(g.TrackLength())
+	trackend := uint32(offset) + tracklen
+
+	var checksum uint32
+	switch data.Type {
+	case RecordData, RecordCompressed:
+		for i := uint32(0); i < tracklen; i++ {
+			checksum += uint32(data.Data[i]) * (i + offset)
+		}
+	case RecordBlank:
+		for i := offset; i < trackend; i++ {
+			checksum += uint32(data.Filler) * i
+		}
+	default:
+		return 0, ErrInvalidDataRecordType
+	}
+
+	return checksum
 }
 
 // Files have a header and some data records.
@@ -183,7 +218,7 @@ func readNextData(r io.Reader, tracklen int) (Data, error) {
 	dat.Type = header[2]
 
 	switch dat.Type {
-	case 0: // uncompressed track
+	case RecordData: // uncompressed track
 		dat.Data = make([]byte, tracklen)
 		n, err = r.Read(dat.Data)
 		if n != tracklen {
@@ -191,7 +226,7 @@ func readNextData(r io.Reader, tracklen int) (Data, error) {
 		} else if err != nil {
 			return dat, err
 		}
-	case 1: // blank track
+	case RecordBlank: // blank track
 		dat.Data = make([]byte, 1)
 		n, err = r.Read(dat.Data)
 		if n != 1 {
@@ -201,7 +236,7 @@ func readNextData(r io.Reader, tracklen int) (Data, error) {
 			return dat, err
 		}
 		dat.Data = make([]byte, tracklen)
-	case 2: // compressed track
+	case RecordCompressed: // compressed track
 		err = binary.Read(r, binary.LittleEndian, &dat.Length)
 		if err != nil {
 			return dat, err
@@ -220,7 +255,7 @@ func readNextData(r io.Reader, tracklen int) (Data, error) {
 			return dat, err
 		}
 	default:
-		return dat, errors.New("*** invalid type ***")
+		return dat, ErrInvalidDataRecordType
 	}
 
 	return dat, nil
@@ -235,6 +270,9 @@ func LoadFile(r io.Reader) (*File, error) {
 		return nil, err
 	}
 
+	var checksum uint32
+	var dataChecksum uint32
+
 	for {
 		var dat Data
 		dat, err = readNextData(r, file.Header.Geometry.TrackLength())
@@ -245,8 +283,16 @@ func LoadFile(r io.Reader) (*File, error) {
 			break
 		}
 		file.Data = append(file.Data, dat)
+		dataChecksum, err = dat.Checksum(file.Header.Geometry)
+		if err != nil {
+			return nil, err
+		}
+		checksum += dataChecksum
 	}
 
+	if checksum != file.Header.Checksum {
+		return nil, ErrInvalidChecksum
+	}
 	return file, err
 }
 
