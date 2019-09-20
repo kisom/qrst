@@ -1,6 +1,7 @@
 package qrst
 
 import (
+	"fmt"
 	"os"
 	"testing"
 )
@@ -29,6 +30,8 @@ func TestRead(t *testing.T) {
 	if len(image) != testFileSize {
 		t.Fatal("qrst: failed to produce a valid image")
 	}
+
+	fmt.Println("Checksum:", checksum(image))
 
 	err = file.VerifyChecksum()
 	if err != nil {

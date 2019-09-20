@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 )
 
@@ -25,8 +26,24 @@ var (
 	ErrBadTrailer            = errors.New("qrst: bad trailer in header")
 	ErrBadDataHeader         = errors.New("qrst: bad data record header")
 	ErrInvalidDataRecordType = errors.New("qrst: invalid data record type")
-	ErrInvalidChecksum       = errors.New("qrst: invalid checksum")
 )
+
+type ErrInvalidChecksum struct {
+	expected uint32
+	computed uint32
+}
+
+func (err ErrInvalidChecksum) Error() string {
+	return fmt.Sprintf("qrst: invalid checksum (expected %d, computed %d)",
+		err.expected, err.computed)
+}
+
+func InvalidChecksum(expected, computed uint32) error {
+	return &ErrInvalidChecksum{
+		expected: expected,
+		computed: computed,
+	}
+}
 
 var magic = []byte("QRST")
 
@@ -163,7 +180,6 @@ type Data struct {
 	Type     byte
 	Length   uint16
 	Data     []byte
-	Checksum uint32
 	Filler   byte
 }
 
@@ -173,23 +189,27 @@ func (data Data) Checksum(g Geometry) (uint32, error) {
 		return 0, err
 	}
 	tracklen := uint32(g.TrackLength())
-	trackend := uint32(offset) + tracklen
+	//trackend := uint32(offset) + tracklen
 
 	var checksum uint32
 	switch data.Type {
 	case RecordData, RecordCompressed:
 		for i := uint32(0); i < tracklen; i++ {
-			checksum += uint32(data.Data[i]) * (i + offset)
+			// fmt.Println("OFF:", offset)
+			offset++
+			checksum += uint32(data.Data[i]) * uint32(offset)
 		}
 	case RecordBlank:
-		for i := offset; i < trackend; i++ {
-			checksum += uint32(data.Filler) * i
+		for i := uint32(0); i < tracklen; i++ {
+			// fmt.Println("OFF:", offset)
+
+			checksum += uint32(data.Filler) * (uint32(offset) + i)
 		}
 	default:
 		return 0, ErrInvalidDataRecordType
 	}
 
-	return checksum
+	return checksum, nil
 }
 
 // Files have a header and some data records.
@@ -235,6 +255,7 @@ func readNextData(r io.Reader, tracklen int) (Data, error) {
 		if err != nil {
 			return dat, err
 		}
+		dat.Filler = dat.Data[0]
 		dat.Data = make([]byte, tracklen)
 	case RecordCompressed: // compressed track
 		err = binary.Read(r, binary.LittleEndian, &dat.Length)
@@ -250,6 +271,7 @@ func readNextData(r io.Reader, tracklen int) (Data, error) {
 			return dat, err
 		}
 
+		dat.Type = RecordData
 		dat.Data, err = decompress(dat.Data, tracklen)
 		if err != nil {
 			return dat, err
@@ -261,6 +283,24 @@ func readNextData(r io.Reader, tracklen int) (Data, error) {
 	return dat, nil
 }
 
+func (file *File) VerifyChecksum() error {
+	var checksum uint32
+
+	for i := range file.Data {
+		dataChecksum, err := file.Data[i].Checksum(file.Header.Geometry)
+		if err != nil {
+			return err
+		}
+		checksum += dataChecksum
+	}
+
+	if checksum != file.Header.Checksum {
+		return InvalidChecksum(file.Header.Checksum, checksum)
+	}
+
+	return nil
+}
+
 // LoadFile reads the file from an io Reader; it doesn't assemble the
 // data.
 func LoadFile(r io.Reader) (*File, error) {
@@ -270,8 +310,8 @@ func LoadFile(r io.Reader) (*File, error) {
 		return nil, err
 	}
 
-	var checksum uint32
-	var dataChecksum uint32
+	log.Printf("header: %s", CapacityToString(file.Header.DiskCapacity))
+	log.Printf("\ttrack length: %d", file.Header.Geometry.TrackLength())
 
 	for {
 		var dat Data
@@ -283,16 +323,8 @@ func LoadFile(r io.Reader) (*File, error) {
 			break
 		}
 		file.Data = append(file.Data, dat)
-		dataChecksum, err = dat.Checksum(file.Header.Geometry)
-		if err != nil {
-			return nil, err
-		}
-		checksum += dataChecksum
 	}
 
-	if checksum != file.Header.Checksum {
-		return nil, ErrInvalidChecksum
-	}
 	return file, err
 }
 
@@ -401,18 +433,10 @@ func (f *File) UpdateChecksum() error {
 
 // TODO: calculate checksum for each sector
 func checksum(data []byte) uint32 {
-	return 0
-}
-
-func (f *File) VerifyChecksum() error {
-	image, err := f.Assemble()
-	if err != nil {
-		return err
+	var cksum uint32
+	for i := 0; i < len(data); i++ {
+		cksum += uint32(data[i]) * uint32(i)
 	}
 
-	if checksum(image) != f.Header.Checksum {
-		return errors.New("qrst: checksum mismatch")
-	}
-
-	return nil
+	return cksum
 }
